@@ -1,16 +1,17 @@
 mod error;
 pub use error::Error;
 mod model;
+use model::Subdomain;
 mod subdomains;
 mod common_ports;
 mod ports;
 
-use model::Subdomain;
-use reqwest::{blocking::Client, redirect};
-use rayon::prelude::*;
-use std::{env, time::Duration};
+use reqwest::Client;
+use std::{env, time::{Duration, Instant}};
+use futures::{stream, StreamExt};
 
-fn main() -> Result<(), anyhow::Error> {
+#[tokio::main]
+async fn main() -> Result<(), anyhow::Error> {
     let args: Vec<String> = env::args().collect();
 
     if args.len() != 2 {
@@ -19,35 +20,20 @@ fn main() -> Result<(), anyhow::Error> {
 
     let target = args[1].as_str();
 
-    let http_timeout = Duration::from_secs(5);
-    let http_client = Client::builder()
-        .redirect(redirect::Policy::limited(4))
-        .timeout(http_timeout)
-        .build()?;
+    let http_timeout = Duration::from_secs(10);
+    let http_client = Client::builder().timeout(http_timeout).build()?;
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(256)
-        .build()
-        .unwrap();
+    let ports_concurrency = 200;
+    let subdomains_concurrency = 100;
+    let scan_start = Instant::now();
 
-    pool.install(|| {
-        let scan_result: Vec<Subdomain> = subdomains::enumerate(&http_client, target)
-            .unwrap()
-            .into_par_iter()
-            .map(ports::scan_ports)
-            .collect();
+    let subdomains = subdomains::enumerate(&http_client, target).await?;
 
-        scan_result
-            .into_iter()
-            .for_each(|subdomain| {
-                println!("domain: {}", &subdomain.domain);
-                subdomain.open_ports
-                    .into_iter()
-                    .for_each(|port| println!("port: {}", port.port));
-
-                println!();
-            });
-        });
+    let scan_result: Vec<Subdomain> = stream::iter(subdomains.into_iter())
+        .map(|subdomain| ports::scan_ports(ports_concurrency, subdomain))
+        .buffer_unordered(subdomains_concurrency)
+        .collect()
+        .await;
 
     Ok(())
 }
